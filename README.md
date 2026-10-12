@@ -1,8 +1,8 @@
 # 🎭 AstrBot TTS 情绪路由插件
 
-[![Version](https://img.shields.io/badge/version-3.1.6-blue.svg)](https://github.com/muyouzhi6/astrbot_plugin_tts_emotion_router)
+[![Version](https://img.shields.io/badge/version-3.3.0-blue.svg)](https://github.com/muyouzhi6/astrbot_plugin_tts_emotion_router)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
 
 面向中文场景的 TTS 插件：支持情绪路由、会话黑白名单策略、分段语音、概率语音，以及按需触发语音输出。
 
@@ -23,14 +23,31 @@
 ## 🚀 快速开始
 
 1. 在 AstrBot 插件市场安装并启用本插件。
-2. 安装 `ffmpeg`（系统可直接调用即可）。
-3. 在插件配置面板填写 TTS 参数（推荐先用 SiliconFlow 跑通）。
-4. 在群聊或私聊发送：
-   - `/sid` 获取当前会话 UMO
-   - `tts_status` 查看当前插件状态
-   - `tts_say` 测试语音输出（不填文本会用默认测试语句）
+2. 在 AstrBot 运行环境安装 `ffmpeg`。本机部署执行 `ffmpeg -version`；Docker 部署执行 `docker exec <AstrBot容器名> ffmpeg -version`，宿主机安装不等于容器已安装。
+3. 在插件配置 → TTS 引擎选择服务商，填写 API Key、服务地址、模型和该模型支持的默认音色。SiliconFlow 的 `gpt-tts-pro` 与 CosyVoice 使用各自的音色 ID，不混用；克隆音色填写服务商返回的完整 ID。
+4. 发送 `/tts_say 你好，请听清最后一个字：好。`，确认收到并播放完整语音。
+5. 发送 `/tts_status` 查看状态；管理员可执行 `/tts_check`，对全部已配置服务商分别合成短音频并完整解码，会产生服务商费用。
+6. 在目标会话执行 `/tts_on`。新安装采用空白名单、关闭概率随机化；已有显式配置保留。群聊开关由 AstrBot 管理员操作，私聊用户可管理自己的会话。
+
+命令示例使用默认唤醒前缀 `/`；修改过 AstrBot 唤醒前缀时请替换。流式文字回复请关闭流式后使用自动语音，或调用 `/tts_say`。使用本插件自动语音时，关闭 AstrBot 设置中的内置自动 TTS，避免文字同发被二次合成。
+
+手动命令与工具共用单次长度上限（默认 200 字，配置位置：功能策略 → LLM 工具 → 最大字数）；超长直接拒绝，不截断。每个实例最多同时合成 2 个手动任务，同一会话同时只能合成 1 个。
 
 配置成功示例：
+
+SiliconFlow 最小配置（在插件配置面板填写）：
+
+| 字段 | 值 |
+|------|----|
+| 服务商 | `siliconflow` |
+| 服务地址 | `https://api.siliconflow.cn/v1` |
+| API Key | 在 [SiliconFlow 控制台](https://cloud.siliconflow.cn/account/ak) 创建并填写 |
+| 模型 | `FunAudioLLM/CosyVoice2-0.5B` |
+| 默认音色 | `FunAudioLLM/CosyVoice2-0.5B:alex` |
+| 音频格式 | `wav` |
+| 语速 | `1.0` |
+
+音色与模型配对见 [官方语音合成文档](https://docs.siliconflow.cn/cn/docs/userguide/capabilities/text-to-speech)。使用预置音色无需上传音频，`voice_map` 可留空。
 
 ![b954f3db3b2c9cabb4814b920b931e69_720](https://github.com/user-attachments/assets/cabc39be-e80d-4e1d-8792-7434606a8031)
 
@@ -102,6 +119,8 @@
 
 ### 6) 分段语音参数
 
+自动分段中任一段合成失败时，改发完整原文；语音投递失败时，立即补发该段文字。
+
 - `segmented_tts.enable`
 - `interval_mode = fixed/adaptive`
 - `fixed_interval`
@@ -115,12 +134,12 @@
 
 | 命令 | 说明 |
 |------|------|
-| `tts_on` | 开启当前会话语音输出 |
-| `tts_off` | 关闭当前会话语音输出 |
-| `tts_all_on` | 开启全局自动语音输出 |
-| `tts_all_off` | 关闭全局自动语音输出（保留按需语音） |
-| `tts_status` | 查看当前状态（含 UMO、策略命中情况） |
-| `tts_say [文本]` | 手动发一条语音（不填文本使用默认测试文本） |
+| `/tts_say [文本]` | 朗读完整文本；不填则合成测试句 |
+| `/tts_status` | 查看当前会话有效状态和配置缺项 |
+| `/tts_on`、`/tts_off` | 开启、关闭当前会话自动语音；群聊需 AstrBot 管理员 |
+| `/tts_check` | 自检全部服务商，已配置的服务商各合成一次短音频（会计费，管理员） |
+| `/tts_all_on`、`/tts_all_off` | 自动语音总开关（管理员）；关闭后保留按需语音 |
+| `/tts_help` | 查看语音命令帮助 |
 
 LLM 工具（函数调用）：
 
@@ -128,7 +147,7 @@ LLM 工具（函数调用）：
 
 ## 🎙 音色克隆与上传（保留）
 
-你原 README 中的音色上传能力已保留，建议顺序如下：
+音色上传步骤：
 
 1. 准备清晰人声音频（建议 10 秒左右，尽量纯净）。
 2. 上传并生成可用音色 ID。
@@ -141,16 +160,16 @@ LLM 工具（函数调用）：
 - 上传工具压缩包：  
   [硅基音色一键上传.zip](https://github.com/user-attachments/files/22064355/default.zip)
 
-`voice_map` 示例：
+CosyVoice2 预置音色的 `voice_map` 示例：
 
 ```yaml
 emotion_route:
   enable: true
   voice_map:
-    neutral: "FunAudioLLM/CosyVoice2-0.5B:anna"
-    happy: "FunAudioLLM/CosyVoice2-0.5B:cheerful"
-    sad: "FunAudioLLM/CosyVoice2-0.5B:gentle"
-    angry: "FunAudioLLM/CosyVoice2-0.5B:serious"
+    neutral: "FunAudioLLM/CosyVoice2-0.5B:alex"
+    happy: "FunAudioLLM/CosyVoice2-0.5B:alex"
+    sad: "FunAudioLLM/CosyVoice2-0.5B:alex"
+    angry: "FunAudioLLM/CosyVoice2-0.5B:alex"
   speed_map:
     neutral: 1.0
     happy: 1.2

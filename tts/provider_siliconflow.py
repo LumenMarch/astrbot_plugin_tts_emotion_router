@@ -11,10 +11,12 @@ from typing import Optional
 import aiohttp
 
 from ..utils.audio import append_audio_silence, validate_audio_file
+from ..core.diagnostics import check_decoder, decode_duration, DecoderUnavailable
+from .errors import http_failure, set_failure
 
 
 COSYVOICE_TAIL_PADDING_MS = 350
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 
 class SiliconFlowTTS:
@@ -91,6 +93,7 @@ class SiliconFlowTTS:
             json.dumps(
                 {
                     "cache_schema": CACHE_SCHEMA_VERSION,
+                    "endpoint": self.api_url,
                     "t": request_text,
                     "v": voice,
                     "m": self.model,
@@ -116,8 +119,61 @@ class SiliconFlowTTS:
                     expected_format=self.format,
                     strict_format=True,
                 ):
+                    out_path.touch()
                     return out_path
                 await asyncio.to_thread(out_path.unlink, missing_ok=True)
+
+            pending_path = out_dir / '.pending' / out_path.name
+
+            async def finish_pending():
+                padded = out_dir / f'.{key}.{uuid.uuid4().hex}.padded.{self.format}'
+                try:
+                    if self.format == 'wav' and not await validate_audio_file(
+                        pending_path, expected_format='wav', strict_format=True
+                    ):
+                        await asyncio.to_thread(pending_path.unlink, missing_ok=True)
+                        set_failure('audio', '供应商音频损坏，请重试或检查模型与音频格式')
+                        return None
+                    if self.format in ('mp3', 'opus'):
+                        try:
+                            await asyncio.to_thread(decode_duration, pending_path, self.format)
+                        except DecoderUnavailable:
+                            raise
+                        except ValueError:
+                            await asyncio.to_thread(pending_path.unlink, missing_ok=True)
+                            set_failure('audio', '供应商音频损坏，请重试或检查模型与音频格式')
+                            return None
+                    ready = await append_audio_silence(
+                        pending_path, padded, tail_padding_ms,
+                        audio_format=self.format, sample_rate=self.sample_rate)
+                    if not await validate_audio_file(ready, expected_format=self.format, strict_format=True):
+                        raise ValueError('invalid padded audio')
+                    await asyncio.to_thread(os.replace, ready, out_path)
+                    await asyncio.to_thread(pending_path.unlink, missing_ok=True)
+                    return out_path
+                except DecoderUnavailable as exc:
+                    set_failure('decoder', str(exc))
+                    return None
+                except Exception:
+                    set_failure('padding', 'CosyVoice 尾音保护失败，已保留原音频；请检查 ffmpeg、格式和采样率后重试')
+                    return None
+                finally:
+                    await asyncio.to_thread(padded.unlink, missing_ok=True)
+
+            if tail_padding_ms:
+                if self.format not in ('wav', 'mp3', 'opus', 'pcm') or (self.format == 'pcm' and not self.sample_rate):
+                    set_failure('padding', 'CosyVoice 请使用 wav、mp3、opus 或配置采样率的 pcm 格式')
+                    return None
+                if self.format != 'wav':
+                    try:
+                        await asyncio.to_thread(check_decoder)
+                    except DecoderUnavailable as exc:
+                        set_failure('decoder', str(exc))
+                        return None
+                if pending_path.exists():
+                    ready = await finish_pending()
+                    if ready is not None or pending_path.exists():
+                        return ready
 
             url = f"{self.api_url}/audio/speech"
             headers = {
@@ -165,7 +221,7 @@ class SiliconFlowTTS:
                                 logging.error(
                                     "SiliconFlowTTS: non-audio response, code=%s, detail=%s",
                                     response.status,
-                                    err,
+                                    "invalid audio response",
                                 )
                                 last_err = err
                                 break
@@ -184,29 +240,12 @@ class SiliconFlowTTS:
 
                             ready_path = raw_path
                             if tail_padding_ms > 0:
-                                try:
-                                    ready_path = await append_audio_silence(
-                                        raw_path,
-                                        padded_path,
-                                        tail_padding_ms,
-                                        audio_format=self.format,
-                                        sample_rate=self.sample_rate,
-                                    )
-                                    if not await validate_audio_file(
-                                        ready_path,
-                                        expected_format=self.format,
-                                        strict_format=True,
-                                    ):
-                                        last_err = {
-                                            "error": "Padded audio file validation failed"
-                                        }
-                                        continue
-                                except (RuntimeError, ValueError) as exc:
-                                    logging.warning(
-                                        "SiliconFlowTTS: tail padding unavailable; using original audio: %s",
-                                        exc,
-                                    )
-                                    ready_path = raw_path
+                                pending_path.parent.mkdir(exist_ok=True)
+                                await asyncio.to_thread(os.replace, raw_path, pending_path)
+                                ready = await finish_pending()
+                                if ready is not None or pending_path.exists():
+                                    return ready
+                                continue
 
                             await asyncio.to_thread(os.replace, ready_path, out_path)
                             logging.info(
@@ -227,8 +266,9 @@ class SiliconFlowTTS:
                             "SiliconFlowTTS: request failed (%s) attempt=%s, detail=%s",
                             response.status,
                             attempt,
-                            err_detail,
+                            "request rejected",
                         )
+                        http_failure(response.status)
                         last_err = err_detail
                         if response.status in (429,) or 500 <= response.status < 600:
                             if attempt <= self.max_retries:
@@ -240,9 +280,10 @@ class SiliconFlowTTS:
                     logging.warning(
                         "SiliconFlowTTS: request or audio processing failed attempt=%s, err=%s",
                         attempt,
-                        e,
+                        type(e).__name__,
                     )
-                    last_err = str(e)
+                    set_failure("network", "连接或处理超时，请检查服务地址、网络和 ffmpeg", True)
+                    last_err = type(e).__name__
                     if attempt <= self.max_retries:
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 8)
@@ -255,6 +296,6 @@ class SiliconFlowTTS:
             await asyncio.to_thread(out_path.unlink, missing_ok=True)
             logging.error(
                 "SiliconFlowTTS: synthesis failed after retries, last_error=%s",
-                last_err,
+                "request/audio failure",
             )
             return None

@@ -159,7 +159,7 @@ class SiliconFlowTTSTests(unittest.IsolatedAsyncioTestCase):
             with wave.open(str(output), "rb") as wav_file:
                 self.assertEqual(wav_file.getnframes(), round(16000 * 0.12))
 
-    async def test_padding_failure_keeps_valid_original_audio(self):
+    async def test_padding_failure_never_caches_unpadded_audio(self):
         session = _FakeSession(_wav_bytes())
         client = self._client(session)
 
@@ -174,9 +174,13 @@ class SiliconFlowTTSTests(unittest.IsolatedAsyncioTestCase):
                     Path(temp_dir),
                 )
 
-            self.assertIsNotNone(output)
-            with wave.open(str(output), "rb") as wav_file:
-                self.assertEqual(wav_file.getnframes(), round(16000 * 0.12))
+            self.assertIsNone(output)
+            self.assertEqual(list(Path(temp_dir).glob('*.wav')), [])
+            self.assertEqual(len(list((Path(temp_dir) / '.pending').glob('*.wav'))), 1)
+            repaired = await client.synth("补静音失败回退测试", "voice-id", Path(temp_dir))
+            with wave.open(str(repaired), "rb") as wav_file:
+                self.assertEqual(wav_file.getnframes(), round(16000 * 0.47))
+            self.assertEqual(len(session.posts), 1)
 
 
 if __name__ == "__main__":

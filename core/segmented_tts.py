@@ -352,6 +352,8 @@ class SegmentedTTSProcessor:
             result.error = str(e)
             logger.error(f"SegmentedTTS: process_only failed: {e}", exc_info=True)
 
+        if result.successful_segments:
+            session_state.last_ts = time.time()
         return result
 
     def _calculate_interval(self, seg_result: SegmentTTSResult) -> float:

@@ -66,7 +66,12 @@ class TextSplitter:
         self.smart_mode = smart_mode
         self.max_segments = max_segments
         self.min_segment_length = min_segment_length
-        self._compiled_pattern = re.compile(split_pattern)
+        try:
+            self._compiled_pattern = re.compile(split_pattern)
+        except re.error:
+            logger.error("segmented_tts.split_pattern 无效，使用默认分段规则")
+            self.split_pattern = self.DEFAULT_SPLIT_PATTERN
+            self._compiled_pattern = re.compile(self.DEFAULT_SPLIT_PATTERN)
     
     def split(self, text: str) -> List[TextSegment]:
         """

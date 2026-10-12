@@ -406,7 +406,7 @@
               "blacklist",
               "whitelist"
             ],
-            "default": "blacklist"
+            "default": "whitelist"
           },
           "enabled_umos": {
             "type": "list",
@@ -523,7 +523,7 @@
           "enable": {
             "type": "bool",
             "description": "启用该功能",
-            "default": true
+            "default": false
           },
           "mode": {
             "type": "string",

@@ -10,6 +10,8 @@ import re
 import logging
 import time
 import heapq
+import copy
+from astrbot.core.star.filter.command import GreedyStr
 from typing import Any, Dict, List, Optional, Tuple
 
 from .core.compat import initialize_compat
@@ -56,6 +58,7 @@ from .core.constants import (
 )
 from .core.session import SessionState
 from .core.config import ConfigManager
+from .core.diagnostics import check_provider, configuration_errors
 from .core.marker import EmotionMarkerProcessor
 from .core.tts_processor import TTSProcessor, TTSConditionChecker, TTSResultBuilder
 from .core.segmented_tts import SegmentedTTSProcessor
@@ -85,6 +88,8 @@ class TTSEmotionRouter(Star):
         self._inflight_sigs: Dict[str, float] = {}
         self._background_tasks: List[asyncio.Task] = []
         self._cleanup_task_started = False
+        self._manual_sessions = set()
+        self._recent_reasons = {}
 
         self._init_config(config)
         self._init_components()
@@ -145,8 +150,8 @@ class TTSEmotionRouter(Star):
             speed_map["neutral"] = float(api_cfg.get("speed", 1.0))
         return voice_map, speed_map
 
-    def _create_tts_client(self):
-        api_cfg = self.config.get_api_config()
+    def _create_tts_client(self, api_cfg=None):
+        api_cfg = api_cfg if api_cfg is not None else self.config.get_api_config()
         provider = api_cfg.get("provider", "siliconflow")
 
         if provider == "minimax":
@@ -735,6 +740,25 @@ class TTSEmotionRouter(Star):
         event: AstrMessageEvent,
         text: str,
     ) -> Tuple[bool, List, str]:
+        limit = self.config.get_llm_tool_max_chars()
+        if limit > 0 and len(text) > limit:
+            return False, [], f"文本共 {len(text)} 字，单次上限 {limit} 字，请缩短后重试。"
+        umo = self._get_umo(event)
+        if umo in self._manual_sessions:
+            return False, [], "本会话已有语音正在合成，请完成后重试。"
+        if len(self._manual_sessions) >= 2:
+            return False, [], "已有 2 个语音任务正在合成，请稍后重试。"
+        self._manual_sessions.add(umo)
+        try:
+            return await self._build_manual_tts_chain_unlocked(event, text)
+        finally:
+            self._manual_sessions.discard(umo)
+
+    async def _build_manual_tts_chain_unlocked(self, event, text):
+        cfg = self.config.get_api_config()
+        errors = self.config.validation_errors() + configuration_errors(cfg, require_default_voice=False)
+        if errors:
+            return False, [], "；".join(errors)
         prepared = self._prepare_text_for_tts(text)
         tts_text = (prepared.tts_text or "").strip()
         send_text = (prepared.display_text or "").strip()
@@ -920,6 +944,9 @@ class TTSEmotionRouter(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, request):
+        if not self.config.is_llm_tool_enabled() and getattr(request, "func_tool", None) is not None:
+            request.func_tool = copy.copy(request.func_tool)
+            request.func_tool.remove_tool("tts_speak")
         try:
             user_prompt = str(getattr(request, "prompt", "") or "")
             if user_prompt:
@@ -1124,6 +1151,11 @@ class TTSEmotionRouter(Star):
         if not tts_text:
             result.chain = display_chain
             return
+        config_errors = self.config.validation_errors()
+        if config_errors:
+            self._recent_reasons[umo] = (time.time(), "；".join(config_errors))
+            result.chain = display_chain
+            return
 
         allowed_components = {"Plain", "At", "Reply", "Image", "Face"}
         has_non_plain = any(type(c).__name__ not in allowed_components for c in result.chain)
@@ -1135,6 +1167,7 @@ class TTSEmotionRouter(Star):
             enable_probability=self.config.is_probability_output_enabled_for_umo(umo),
         )
         if not check_res.passed:
+            self._recent_reasons[umo] = (time.time(), check_res.reason)
             result.chain = display_chain
             return
 
@@ -1155,25 +1188,27 @@ class TTSEmotionRouter(Star):
 
             if segmented_enabled:
                 seg_res = await self.segmented_tts_processor.process_only(tts_text, st)
+                # RespondStage sends records before text when host segmentation is off.
+                # A complete text fallback preserves meaning in either host mode.
+                if any(not seg.success or not seg.audio_path for seg in seg_res.segments):
+                    result.chain = display_chain
+                    return
                 if seg_res.successful_segments:
-                    out_chain = []
-                    if text_voice_enabled and send_text:
-                        out_chain.append(Plain(text=send_text))
-                    for seg in seg_res.successful_segments:
-                        if not seg.audio_path:
-                            continue
-                        out_chain.append(Record(file=self.tts_processor.normalize_audio_path(seg.audio_path)))
-                    for comp in result.chain:
-                        if not isinstance(comp, Plain):
-                            out_chain.append(comp)
-                    if out_chain:
-                        result.chain = out_chain
-                        if send_text:
-                            await self._queue_pending_spoken_assistant_text(
-                                event,
-                                send_text,
-                            )
-                        return
+                    from .core.segment_delivery import pace_records
+                    original_non_plain = [comp for comp in result.chain if not isinstance(comp, Plain)]
+                    chain = [Plain(text=send_text)] if text_voice_enabled and send_text else []
+                    records = []
+                    for seg in seg_res.segments:
+                        if seg.success and seg.audio_path:
+                            record = Record(file=self.tts_processor.normalize_audio_path(seg.audio_path))
+                            chain.append(record)
+                            records.append((record, self.segmented_tts_processor._calculate_interval(seg), seg.segment.text))
+                    result.chain = original_non_plain + chain
+                    pace_records(event, records, st)
+                    event._tts_segment_delivery['conversation_id'] = await self._get_current_conversation_id(event)
+                    return
+                result.chain = display_chain
+                return
 
             proc_res = await self.tts_processor.process(tts_text, st)
             if proc_res.success and proc_res.audio_path:
@@ -1189,6 +1224,7 @@ class TTSEmotionRouter(Star):
                         send_text,
                     )
             else:
+                self._recent_reasons[umo] = (time.time(), proc_res.error or "合成失败，已保留文字")
                 result.chain = display_chain
         finally:
             self._inflight_sigs.pop(sig, None)
@@ -1261,11 +1297,11 @@ class TTSEmotionRouter(Star):
                     raise TypeError("conversation history is not a list")
             except Exception:
                 logger.warning(
-                    "conversation history parse failed sid=%s cid=%s; reset to empty history",
+                    "conversation history parse failed sid=%s cid=%s; preserving original",
                     sid,
                     target_cid,
                 )
-                history = []
+                return False
 
             history.append({"role": "assistant", "content": cleaned})
             await manager.update_conversation(
@@ -1284,6 +1320,14 @@ class TTSEmotionRouter(Star):
         @filter.after_message_sent(priority=-1000)
         async def after_message_sent(self, event: AstrMessageEvent):
             try:
+                delivery = getattr(event, '_tts_segment_delivery', None)
+                if delivery is not None:
+                    delivery['restore']()
+                    del event._tts_segment_delivery
+                    if delivery['texts']:
+                        await self._remember_spoken_assistant_text(
+                            event, ' '.join(delivery['texts']),
+                            conversation_id=delivery.get('conversation_id'))
                 result = event.get_result()
                 if not result:
                     return
@@ -1338,6 +1382,44 @@ class TTSEmotionRouter(Star):
 
     # ---------------- commands & llm tool ----------------
 
+    @filter.command("tts_help", priority=1)
+    async def tts_help(self, event: AstrMessageEvent):
+        """查看语音命令帮助。"""
+        yield event.plain_result(
+            "/tts_say [文本]：朗读完整文本；不填则合成测试句\n"
+            "/tts_status：查看当前会话有效状态和配置缺项\n"
+            "/tts_on、/tts_off：开启、关闭当前会话自动语音；群聊需 AstrBot 管理员\n"
+            "/tts_check：自检全部服务商，已配置的服务商各合成一次短音频（会计费，管理员）\n"
+            "/tts_all_on、/tts_all_off：自动语音总开关（管理员）\n"
+            "/tts_help：查看语音命令帮助"
+        )
+
+    @filter.command("tts_check", priority=1)
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def tts_check(self, event: AstrMessageEvent):
+        """自检全部服务商；已配置者各合成短音频，会计费（管理员）。"""
+        if not event.is_admin():
+            yield event.plain_result("自检会调用付费接口，仅 AstrBot 管理员可执行。")
+            return
+        if getattr(self, "_checking", False):
+            yield event.plain_result("自检正在进行，请等待完成。")
+            return
+        self._checking = True
+        try:
+            errors = self.config.validation_errors()
+            yield event.plain_result("❌ 运行配置：" + "；".join(errors) if errors else "✅ 运行配置数值")
+            warnings = self.config.validation_warnings()
+            if warnings:
+                yield event.plain_result("配置警告：" + "；".join(warnings))
+            for provider in ("siliconflow", "minimax", "mimo"):
+                engine = copy.deepcopy(self.config.get("tts_engine", {}))
+                engine["provider"] = provider
+                cfg = ConfigManager({"tts_engine": engine}).get_api_config()
+                lines = await check_provider(cfg, self._create_tts_client)
+                yield event.plain_result("\n".join(lines))
+        finally:
+            self._checking = False
+
     async def _switch_voice_output_for_current_umo(
         self,
         event: AstrMessageEvent,
@@ -1347,8 +1429,7 @@ class TTSEmotionRouter(Star):
         umo = self._get_umo(event)
         policy = self.config.get_feature_policy("voice_output")
         if enable and not bool(policy.get("enable", True)):
-            await self.config.set_voice_output_enable_async(True)
-            policy = self.config.get_feature_policy("voice_output")
+            raise ValueError("自动语音总开关已关闭，请 AstrBot 管理员先执行 /tts_all_on。")
         mode = policy.get("mode", "blacklist")
 
         if mode == "whitelist":
@@ -1367,35 +1448,56 @@ class TTSEmotionRouter(Star):
 
     @filter.command("tts_on", priority=1)
     async def tts_on(self, event: AstrMessageEvent):
-        umo = await self._switch_voice_output_for_current_umo(event, enable=True)
+        """开启当前会话自动语音；群聊需 AstrBot 管理员。"""
+        if event.get_group_id() and not event.is_admin():
+            yield event.plain_result("群聊自动语音开关仅 AstrBot 管理员可修改。")
+            return
+        try:
+            umo = await self._switch_voice_output_for_current_umo(event, enable=True)
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
         yield event.plain_result(f"当前会话已开启语音输出。UMO={umo}")
 
     @filter.command("tts_off", priority=1)
     async def tts_off(self, event: AstrMessageEvent):
+        """关闭当前会话自动语音；群聊需 AstrBot 管理员。"""
+        if event.get_group_id() and not event.is_admin():
+            yield event.plain_result("群聊自动语音开关仅 AstrBot 管理员可修改。")
+            return
         umo = await self._switch_voice_output_for_current_umo(event, enable=False)
         yield event.plain_result(f"当前会话已关闭语音输出。UMO={umo}")
 
     @filter.command("tts_all_on", priority=1)
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def tts_all_on(self, event: AstrMessageEvent):
-        _ = event
+        """开启自动语音总开关（AstrBot 管理员）。"""
+        if not event.is_admin():
+            yield event.plain_result("仅 AstrBot 管理员可修改总开关。")
+            return
         await self.config.set_voice_output_enable_async(True)
         self._update_components_from_config()
         yield event.plain_result("已开启全局自动语音输出。")
 
     @filter.command("tts_all_off", priority=1)
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def tts_all_off(self, event: AstrMessageEvent):
-        _ = event
+        """关闭自动语音总开关（AstrBot 管理员）；保留按需语音。"""
+        if not event.is_admin():
+            yield event.plain_result("仅 AstrBot 管理员可修改总开关。")
+            return
         await self.config.set_voice_output_enable_async(False)
         self._update_components_from_config()
         yield event.plain_result("已关闭全局自动语音输出。可用 tts_say 或 tts_speak 按需发语音。")
 
     @filter.command("tts_status", priority=1)
     async def tts_status(self, event: AstrMessageEvent):
+        """查看当前会话有效状态和配置缺项。"""
         umo = self._get_umo(event)
         provider = self.config.get_tts_provider()
         voice_enabled = self.config.is_voice_output_enabled_for_umo(umo)
         text_voice_enabled = self.config.is_text_voice_output_enabled_for_umo(umo)
-        segmented_enabled = self.config.is_segmented_output_enabled_for_umo(umo)
+        segmented_enabled = self.segmented_tts_enabled and self.config.is_segmented_output_enabled_for_umo(umo)
         probability_enabled = self.config.is_probability_output_enabled_for_umo(umo)
 
         msg = (
@@ -1408,11 +1510,29 @@ class TTSEmotionRouter(Star):
             f"prob: {self.prob}, text_limit: {self.text_limit}, cooldown: {self.cooldown}s\n"
             "提示: 在聊天中发送 /sid 可获取当前 UMO。"
         )
+        cfg = self.config.get_api_config()
+        cfg["default_voice"] = cfg.get("default_voice") or self.voice_map.get("neutral")
+        msg += f"\n凭据已配置: {bool(cfg.get('key'))}\n默认音色已配置: {bool(cfg.get('default_voice'))}\n分段触发字数: {self.segmented_min_chars}"
+        if event.is_admin():
+            msg += f"\n模型: {cfg.get('model', '')}"
+            host = self.context.get_config(umo)
+            msg += f"\nAstrBot 内置自动 TTS: {bool(host.get('provider_tts_settings', {}).get('enable'))}"
+        errors = self.config.validation_errors() + configuration_errors(cfg, require_default_voice=False)
+        if errors:
+            msg += "\n配置待修复: " + "；".join(errors)
+        warnings = self.config.validation_warnings()
+        if warnings:
+            msg += "\n配置警告: " + "；".join(warnings)
+        if umo in self._recent_reasons:
+            ts, reason = self._recent_reasons[umo]
+            msg += f"\n最近跳过 ({time.strftime('%H:%M:%S', time.localtime(ts))}): {reason}"
+        msg += "\n流式文字回复请关闭流式后使用自动语音，或调用 /tts_say。\n使用本插件自动语音时，请关闭 AstrBot 设置中的内置自动 TTS，避免文字同发被再次合成。"
         yield event.plain_result(msg)
 
     @filter.command("tts_say", priority=1)
-    async def tts_say(self, event: AstrMessageEvent, *, text: Optional[str] = None):
-        content = (text or DEFAULT_TEST_TEXT).strip()
+    async def tts_say(self, event: AstrMessageEvent, text: GreedyStr):
+        """朗读完整文本；不填文本时合成测试句，不受自动开关影响。"""
+        content = str(text).strip()
         if not content:
             content = DEFAULT_TEST_TEXT
 
@@ -1453,7 +1573,7 @@ class TTSEmotionRouter(Star):
                 string: 发送结果文本（成功/失败说明）。
             """
             if not self.config.is_llm_tool_enabled():
-                yield None
+                yield "未发送语音：语音工具已关闭，请用文字回答。"
                 return
 
             content = (text or "").strip()
@@ -1463,18 +1583,13 @@ class TTSEmotionRouter(Star):
 
             max_chars = self.config.get_llm_tool_max_chars()
             if max_chars > 0 and len(content) > max_chars:
-                logger.warning("tts_speak text truncated %d -> %d chars", len(content), max_chars)
-                content = content[:max_chars]
+                yield f"未发送语音：文本共 {len(content)} 字，上限 {max_chars} 字，请用文字回答。"
+                return
 
             ok, chain, history_or_error = await self._build_manual_tts_chain(event, content)
             if not ok:
                 logging.warning("tts_speak synthesis failed: %s", history_or_error)
-                event.clear_result()
-                # Do not expose the low-level failure text to the LLM.  If the
-                # model sees "audio generation failed", it tends to roleplay a
-                # broken voice ("嗓子被封印") and sends confusing fallback text.
-                yield None
-                yield "语音请求已处理。"
+                yield "未发送语音：合成失败，请用文字回答。"
                 return
 
             history_text = history_or_error.strip()
@@ -1488,7 +1603,7 @@ class TTSEmotionRouter(Star):
             except Exception as e:
                 st.clear_pending_history()
                 logging.error("tts_speak send failed: %s", e)
-                yield f"发送失败：{e}"
+                yield "未发送语音：平台投递失败，请用文字回答。"
                 return
 
             if history_text:

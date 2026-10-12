@@ -5,6 +5,8 @@ import base64
 import hashlib
 import json
 import logging
+from .errors import http_failure, set_failure
+from .cache import audio_cache
 import re
 from pathlib import Path
 from typing import Dict, Optional, Sequence
@@ -349,7 +351,7 @@ class MiMoTTS:
         )
         assistant_content = f"{style_prefix}{synth_text}" if style_prefix else synth_text
         if strict_sing:
-            logger.info("MiMoTTS: strict singing content=%r", assistant_content[:200])
+            logger.info("MiMoTTS: strict singing chars=%d", len(assistant_content))
         messages.append(
             {
                 "role": "assistant",
@@ -370,6 +372,7 @@ class MiMoTTS:
             "audio": audio_params,
         }
 
+    @audio_cache
     async def synth(
         self,
         text: str,
@@ -501,7 +504,7 @@ class MiMoTTS:
                         audio_data = message.get("audio", {}).get("data")
 
                         if not audio_data:
-                            logger.error(f"MiMoTTS: 返回无音频数据: {data}")
+                            logger.error("MiMoTTS: 返回无音频数据")
                             last_err = {"error": "No audio data in response"}
                             break
 
@@ -531,8 +534,9 @@ class MiMoTTS:
                         err_detail = {"error": text_content[:200]}
 
                     logger.warning(
-                        f"MiMoTTS: 请求失败({r.status}) attempt={attempt}, detail={err_detail}"
+                        f"MiMoTTS: 请求失败({r.status}) attempt={attempt}"
                     )
+                    http_failure(r.status)
                     last_err = err_detail
                     if r.status in (429,) or 500 <= r.status < 600:
                         if attempt <= self.max_retries:
@@ -541,8 +545,9 @@ class MiMoTTS:
                             continue
                     break
             except Exception as e:
-                logger.warning(f"MiMoTTS: 网络异常 attempt={attempt}, err={e}")
-                last_err = str(e)
+                logger.warning("MiMoTTS: request failed attempt=%s type=%s", attempt, type(e).__name__)
+                set_failure("network", "MiMo 请求或解码异常，请检查网络与音频格式", True)
+                last_err = type(e).__name__
                 if attempt <= self.max_retries:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 8)
@@ -557,5 +562,5 @@ class MiMoTTS:
             await asyncio.to_thread(_cleanup)
         except Exception:
             pass
-        logger.error(f"MiMoTTS: 合成失败，已放弃。last_error={last_err}")
+        logger.error("MiMoTTS: 合成失败")
         return None

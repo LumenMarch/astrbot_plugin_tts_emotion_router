@@ -4,6 +4,8 @@ import copy
 import hashlib
 import json
 import logging
+from .errors import http_failure, set_failure
+from .cache import audio_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -169,10 +171,11 @@ class MiniMaxTTS:
         }
 
     def _log_response_meta(self, meta: dict[str, Any]) -> None:
-        compact_meta = {key: value for key, value in meta.items() if value not in (None, "", [], {})}
+        compact_meta = {key: value for key, value in meta.items() if key != "status_msg" and isinstance(value, (int, float))}
         if compact_meta:
             logger.info("MiniMaxTTS response meta: %s", compact_meta)
 
+    @audio_cache
     async def synth(
         self,
         text: str,
@@ -266,6 +269,7 @@ class MiniMaxTTS:
                             self._log_response_meta(meta)
 
                             if (data.get("base_resp") or {}).get("status_code", 0) != 0:
+                                set_failure("provider", "MiniMax 拒绝合成，请检查凭据、余额、模型和音色")
                                 last_error = (data.get("base_resp") or {}).get("status_msg")
                                 break
 
@@ -302,7 +306,8 @@ class MiniMaxTTS:
                         err = await resp.json(content_type=None)
                     except Exception:
                         err = await resp.text()
-                    last_error = f"http {resp.status}: {err}"
+                    http_failure(resp.status)
+                    last_error = f"http {resp.status}"
                     if resp.status in (429,) or 500 <= resp.status < 600:
                         if attempt <= self.max_retries:
                             await asyncio.sleep(backoff)
@@ -310,7 +315,8 @@ class MiniMaxTTS:
                             continue
                     break
             except Exception as e:
-                last_error = str(e)
+                set_failure("network", "MiniMax 请求或解码异常，请检查网络与音频格式", True)
+                last_error = type(e).__name__
                 if attempt <= self.max_retries:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 8)
@@ -323,5 +329,5 @@ class MiniMaxTTS:
         except Exception:
             pass
 
-        logger.error("MiniMaxTTS synth failed: %s", last_error)
+        logger.error("MiniMaxTTS synthesis failed")
         return None

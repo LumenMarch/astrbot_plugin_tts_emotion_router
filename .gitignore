@@ -3,6 +3,7 @@
 test_*.py
 debug_*.py
 *debug*.py
+!tests/*.py
 
 # 数据文件
 data/

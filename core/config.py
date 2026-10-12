@@ -69,7 +69,9 @@ def _normalize_mode(mode: Any) -> str:
 
 def _safe_float(value: Any, default: float) -> float:
     try:
-        return float(value)
+        import math
+        number = float(value)
+        return number if math.isfinite(number) else default
     except Exception:
         return default
 
@@ -177,6 +179,8 @@ class ConfigManager:
         ]:
             if feat not in fp:
                 fp[feat] = self._feature_defaults(default_enable)
+                if feat == FEATURE_VOICE_OUTPUT:
+                    fp[feat]["mode"] = "whitelist"
         llm_tool = fp.get("llm_tool", {}) or {}
         if "enable" not in llm_tool:
             llm_tool["enable"] = True
@@ -651,6 +655,44 @@ class ConfigManager:
 
     def get_segmented_tts_config(self) -> Dict[str, Any]:
         return self.get("segmented_tts", {}) or {}
+
+    def validation_errors(self) -> List[str]:
+        import math
+        errors = []
+        def check(path, value, low, high):
+            try:
+                number = float(value)
+                valid = math.isfinite(number) and low <= number <= high
+            except (ValueError, TypeError):
+                valid = False
+            if not valid:
+                errors.append(f"{path} 须在 {low}～{high} 之间")
+        check("probability.prob", self.get("probability", {}).get("prob", DEFAULT_PROB), 0, 1)
+        for key, default in (("text_limit", 200), ("text_min_limit", 5), ("cooldown", 0)):
+            check(key, self.get(key, default), 0, 100000)
+        if self.get_text_limit() > 0 and self.get_text_min_limit() > self.get_text_limit():
+            errors.append("text_min_limit 不得大于 text_limit")
+        engine = self.get("tts_engine", {})
+        check("tts_engine.timeout", engine.get("timeout", 30), 1, 300)
+        check("tts_engine.max_retries", engine.get("max_retries", 2), 0, 5)
+        provider = self.get_tts_provider()
+        provider_cfg = engine.get(provider, {})
+        check(f"tts_engine.{provider}.speed", provider_cfg.get("speed", 1), 0.5, 2)
+        segment = self.get_segmented_tts_config()
+        for key, default in (("fixed_interval", 1.5), ("adaptive_buffer", 0.5),
+                             ("max_segments", 10), ("min_segment_chars", 50),
+                             ("min_segment_length", 5)):
+            check(f"segmented_tts.{key}", segment.get(key, default), 0, 10000)
+        check("feature_policies.llm_tool.max_chars", self._get_llm_tool_config().get("max_chars", 200), 0, 100000)
+        return errors
+
+    def validation_warnings(self) -> List[str]:
+        import re
+        try:
+            re.compile(self.get_segmented_tts_split_pattern())
+        except re.error:
+            return ["segmented_tts.split_pattern 无效，运行时使用默认规则"]
+        return []
 
     def is_segmented_tts_enabled(self) -> bool:
         return bool(self.get_segmented_tts_config().get("enable", False))

@@ -198,6 +198,8 @@ class TTSProcessor:
             处理结果
         """
         result = TTSProcessingResult(text=text)
+        from ..tts.errors import failure
+        failure.set(None)
 
         try:
             # 1. 确定情绪
@@ -222,7 +224,7 @@ class TTSProcessor:
                     voice_key, voice_uri = "default", default_voice
                 else:
                     result.success = False
-                    result.error = f"no voice available for emotion: {emotion}"
+                    result.error = "未设置音色，请填写 TTS 引擎 → 当前服务商 → 默认音色，或情绪路由音色映射"
                     logger.warning(f"TTS skip: {result.error}")
                     return result
 
@@ -260,12 +262,13 @@ class TTSProcessor:
                 self._update_session_state(session_state, result)
             else:
                 result.success = False
-                result.error = "audio generation failed"
+                detail = failure.get()
+                result.error = detail.message if detail else "音频生成失败，请执行 /tts_check 检查配置、网络和音频依赖"
 
         except Exception as e:
             result.success = False
-            result.error = str(e)
-            logger.error(f"TTS process failed: {e}", exc_info=True)
+            result.error = "语音处理失败，请检查配置并执行 /tts_check"
+            logger.error("TTS process failed: %s", type(e).__name__)
 
         return result
 

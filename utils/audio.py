@@ -20,9 +20,9 @@ def ensure_dir(p: Path):
     同步确保目录存在（非阻塞不严重，可保持同步或在初始化调用）。
     如果需要在运行时频繁调用，建议改用 async_ensure_dir。
     """
-    try:
-        p.mkdir(parents=True, exist_ok=True)
-    except Exception:
+    p.mkdir(parents=True, exist_ok=True)
+    import tempfile
+    with tempfile.TemporaryFile(dir=p):
         pass
 
 
@@ -41,7 +41,7 @@ async def cleanup_dir(root: Path, ttl_seconds: int = AUDIO_CLEANUP_TTL_SECONDS):
             now = time.time()
             for f in root.glob("**/*"):
                 try:
-                    if f.is_file() and (now - f.stat().st_mtime) > ttl_seconds:
+                    if not any(part.startswith('.') for part in f.relative_to(root).parts) and f.is_file() and (now - f.stat().st_mtime) > ttl_seconds:
                         f.unlink()
                 except Exception:
                     pass
@@ -92,7 +92,8 @@ async def append_audio_silence(
                 frames = source.readframes(params.nframes)
 
             silence_frames = round(params.framerate * duration_ms / 1000)
-            silence = b"\x00" * silence_frames * params.nchannels * params.sampwidth
+            silence_byte = b"\x80" if params.sampwidth == 1 else b"\x00"
+            silence = silence_byte * silence_frames * params.nchannels * params.sampwidth
             with wave.open(str(output_path), "wb") as target:
                 target.setparams(params)
                 target.writeframes(frames)
@@ -248,6 +249,9 @@ def _validate_audio_file_sync(
                                 "validate_audio_file: WAV contains no decodable frames: %s",
                                 audio_path,
                             )
+                            return False
+                        frames = wav_file.readframes(wav_file.getnframes())
+                        if len(frames) != wav_file.getnframes() * wav_file.getnchannels() * wav_file.getsampwidth():
                             return False
             except Exception as e:
                 if strict_format:

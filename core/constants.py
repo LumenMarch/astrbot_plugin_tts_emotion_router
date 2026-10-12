@@ -9,13 +9,21 @@ import re
 PLUGIN_ID = "astrbot_plugin_tts_emotion_router"
 PLUGIN_NAME = "TTS 情绪路由"
 PLUGIN_DESC = "支持情绪路由、多服务商与会话策略的 TTS 插件。"
-PLUGIN_VERSION = "3.2.3"
+PLUGIN_VERSION = "3.3.0"
 PLUGIN_AUTHOR = "muyouzhi6"
 
 # Paths
 PLUGIN_DIR = Path(__file__).parent.parent
 CONFIG_FILE = PLUGIN_DIR / "config.json"
 TEMP_DIR = PLUGIN_DIR / "temp"
+try:
+    from astrbot.api.star import StarTools
+except ImportError:
+    pass  # Standalone tests do not run inside AstrBot.
+else:
+    DATA_DIR = StarTools.get_data_dir(PLUGIN_ID)
+    CONFIG_FILE = DATA_DIR / "config.json"
+    TEMP_DIR = DATA_DIR / "audio"
 
 # Emotion constants - 18 emotions are inferred from dialogue context.
 # 基础情绪 (9种): 开心/悲伤/愤怒/恐惧/惊讶/兴奋/委屈/平静/冷漠
@@ -276,7 +284,7 @@ DEFAULT_PROB: float = 0.8
 DEFAULT_VOICE_OUTPUT_ENABLE: bool = True
 DEFAULT_TEXT_VOICE_ENABLE: bool = False
 DEFAULT_SEGMENTED_OUTPUT_ENABLE: bool = False
-DEFAULT_PROBABILITY_OUTPUT_ENABLE: bool = True
+DEFAULT_PROBABILITY_OUTPUT_ENABLE: bool = False
 
 # Defaults: runtime checks
 DEFAULT_TEXT_LIMIT: int = 200
